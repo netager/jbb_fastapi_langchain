@@ -1,19 +1,20 @@
 from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
+
 from fastapi import FastAPI, Query
 from fastapi.responses import StreamingResponse
-from dotenv import load_dotenv
 from pydantic import BaseModel
-# from langchain_jb import pdf_chain, pdf_retriever
-from rag.pdf import PDFRetrievalChain
-import asyncio
-import os
 
-# tokenizers 병렬 처리 설정
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+from rag.pdf import PDFRetrievalChain
+
+import asyncio
+from functools import lru_cache
+from typing import List, Dict, Any
+from dotenv import load_dotenv
 
 load_dotenv()
+
 app = FastAPI()
 
 # PDF 체인을 전역 변수로 초기화
@@ -21,80 +22,62 @@ pdf = PDFRetrievalChain().create_chain()
 pdf_retriever = pdf.retriever
 pdf_chain = pdf.chain
 
+# 검색 결과 캐싱
+@lru_cache(maxsize=100)
+def cache_search_results(question: str) -> str:
+    return pdf.process_search_results(question)
+
 class ChatRequest(BaseModel):
     question: str
     chat_history: list
 
 @app.post("/streaming_async/chat")
 async def streaming_async(request: ChatRequest):
+    CHUNK_SIZE = 3  # 작은 청크 사이즈로 변경
+    
     async def event_stream():
-        print(f"query: {request.question}")
-
         try:
-            # PDF 검색을 비동기로 실행
-            # search_results = await asyncio.to_thread(pdf_retriever.invoke, request.question)
-            # print(f"search_results: {search_results}")
+            # 검색 결과를 백그라운드에서 미리 가져오기
+            search_task = asyncio.create_task(
+                asyncio.to_thread(cache_search_results, request.question)
+            )
 
-            search_results = pdf.process_search_results(request.question)
-            # print(f"search_results: {search_results}")
-
-            # 청크 크기를 조절하여 응답 속도 개선
             buffer = []
             async for chunk in pdf_chain.astream({
-                "question": request.question, 
-                # "context": search_results, 
-                "chat_history": request.chat_history,
+                "question": request.question,
+                "chat_history": request.chat_history or []
             }):
-                if len(chunk) > 0:
+                if chunk:
                     buffer.append(chunk)
-                    # 버퍼가 일정 크기가 되면 한 번에 전송
-                    if len(buffer) >= 5:
+                    if len(buffer) >= CHUNK_SIZE:
                         yield str(''.join(buffer))
                         buffer = []
+                        await asyncio.sleep(0)  # 다른 코루틴에게 실행 기회 제공
             
             # 남은 버퍼 전송
             if buffer:
                 yield str(''.join(buffer))
 
-            yield f"\n\n\n{search_results}"            
+            # 검색 결과 가져오기
+            search_results = await search_task
+            if search_results:
+                yield f"\n\n{search_results}"
 
-            # ai_answer = "[감사합니다.](http://jabis.jbbank.co.kr)"
-            # yield f"\n\n\n{ai_answer}"
-                
         except Exception as e:
-            print(f"Error: {e}")
-            yield str(e)
+            print(f"Error in streaming: {str(e)}")
+            yield str({"error": str(e)})
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Nginx 프록시 버퍼링 비활성화
+        }
+    )
 
-# 비동기적 호출: ainvoke
-# ----------------------
-# @app.get("/async/chat")
-# async def async_chat(query: str = Query(None, min_length=3, max_length=50)):
-#     response = await chain.ainvoke({"query": query})
-#     return response
-
-# 스트리밍 방식의 동기적 호출: stream
-# -----------------------------------
-# @app.get("/stream/chat")
-# @app.post("/stream/chat")
-# def stream_chat(query: str = Query(None, min_length=3, max_length=50)):
-#     def event_stream():
-#         print(f"query: {query}")
-#         for chunk in chain.stream({"query": query}):
-#             yield chunk
-#     return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-# @app.get("/streaming_async/chat")
-# @app.post("/streaming_async/chat")
-# async def streaming_async(request: ChatRequest):
-#     async def event_stream():
-#         print(f"query: {request.query}")
-#         try:
-#             async for chunk in chain.astream({"query": request.query}):
-#                 if len(chunk) > 0:
-#                     yield f"data: {chunk}\n\n"
-#         except Exception as e:
-#             yield f"data: {str(e)}\n\n"
-
-#     return StreamingResponse(event_stream(), media_type="text/event-stream")
+# 서버 상태 모니터링 엔드포인트
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
